@@ -1,0 +1,317 @@
+// =======================================================
+// Hybrid Landsat-8 DSWE labels for Rainfall 
+// =======================================================
+
+// =======================
+// 0) SETTINGS
+// =======================
+var DEBUG_MODE = false; 
+
+var START_YEAR = 2015;
+var END_YEAR   = 2021;
+
+var eraStep = 0.25;
+var num_lon = 5;
+var num_lat = 3;
+
+var lon_min = -13.75;
+var lat_min =  9.25;
+
+var lon_max = lon_min + num_lon * eraStep;
+var lat_max = lat_min + num_lat * eraStep;
+
+var roi = ee.Geometry.Rectangle([lon_min, lat_min, lon_max, lat_max], null, false);
+
+var SCALE = 30;
+var TILE_SCALE = 16;
+
+var EXPORT_FOLDER = 'EarthEngine_ML_Data';
+var EXPORT_DESC   = 'L8_Hybrid_Acq_DSWE_v11_Final';
+var EXPORT_PREFIX = 'l8_hybrid_dswe_v11';
+
+// Pick policy for non-rainy months
+var PICK_NONJAS = 'leastCloudy'; 
+
+Map.centerObject(roi, 9);
+if (DEBUG_MODE) {
+  Map.addLayer(roi, {color:'red', fillColor: '00000000'}, 'ROI Bounds', false);
+}
+
+// =======================
+// 1) LAND MASK (DEM-based)
+// =======================
+var dem = ee.Image('USGS/SRTMGL1_003');
+var landMask = dem.mask(); // 1 where land exists
+
+
+// =======================
+// 2) LANDSAT 8 L2 MASK (FIXED: EXCLUSIVE STRATEGY)
+// =======================
+function maskL8(image) {
+  var qa = image.select('QA_PIXEL');
+
+  // "Exclusive" Strategy: Mask only if definitely Cloud or Shadow.
+  // We Keep Cirrus/Snow bits because they often flag turbid water falsely.
+  var mask = qa.bitwiseAnd(1 << 0).eq(0)  // No Fill
+    .and(qa.bitwiseAnd(1 << 1).eq(0))     // No Dilated Cloud
+    .and(qa.bitwiseAnd(1 << 3).eq(0))     // No Cloud
+    .and(qa.bitwiseAnd(1 << 4).eq(0));    // No Cloud Shadow
+
+  var optical = image.select(['SR_B2','SR_B3','SR_B4','SR_B5','SR_B6','SR_B7'])
+    .multiply(0.0000275)
+    .add(-0.2);
+
+  return optical
+    .updateMask(mask)
+    .copyProperties(image, image.propertyNames())
+    .set('system:time_start', image.get('system:time_start'));
+}
+
+
+// =======================
+// 3) WATER INDICES & DSWE
+// =======================
+function dswe_fn(image) {
+  var img = image.select(['SR_B3','SR_B5','SR_B6'], ['green','nir','swir1']);
+
+  var ndwi  = img.normalizedDifference(['green','nir']).rename('NDWI');
+  var mndwi = img.normalizedDifference(['green','swir1']).rename('MNDWI');
+  
+  // WI = Max(NDWI, MNDWI)
+  var wi    = ndwi.max(mndwi).rename('WI');
+
+  // DSWE Classification Logic
+  var dsweClass = ee.Image(0).rename('DSWE_Class');
+  dsweClass = dsweClass.where(wi.gt(0.10), 1);
+  dsweClass = dsweClass.where(wi.gt(0.20), 2);
+  dsweClass = dsweClass.where(wi.gt(0.30), 3);
+  dsweClass = dsweClass.where(wi.gt(0.40), 4);
+  
+  // WaterBinary: 1 if ANY water class, 0 if dry
+  var waterBinary = dsweClass.gt(0).rename('WaterBinary');
+
+  return image.addBands([ndwi, mndwi, wi, dsweClass, waterBinary]);
+}
+
+
+// =======================
+// 4) DEFINE 15 ERA5-ALIGNED GRID CELLS
+// =======================
+var lon_boundaries = ee.List.sequence(lon_min, lon_max, eraStep);
+var lat_boundaries = ee.List.sequence(lat_min, lat_max, eraStep);
+
+var gridFeatures = ee.List.sequence(0, num_lon - 1).map(function(i) {
+  return ee.List.sequence(0, num_lat - 1).map(function(j) {
+    i = ee.Number(i); j = ee.Number(j);
+    var x1 = ee.Number(lon_boundaries.get(i));
+    var x2 = ee.Number(lon_boundaries.get(i.add(1)));
+    var y1 = ee.Number(lat_boundaries.get(j));
+    var y2 = ee.Number(lat_boundaries.get(j.add(1)));
+    
+    var cell_id = i.add(j.multiply(num_lon)).add(1);
+    
+    return ee.Feature(ee.Geometry.Rectangle([x1, y1, x2, y2], null, false), {
+      'Region_ID': cell_id, 'lon': x1, 'lat': y1
+    });
+  });
+}).flatten();
+
+var trainingRegions = ee.FeatureCollection(gridFeatures);
+
+
+// =======================
+// 5) PRECOMPUTE LandPixCount
+// =======================
+var landCountImg = ee.Image.constant(1).updateMask(landMask).rename('one');
+var regionsWithLandPix = trainingRegions.map(function(f) {
+  var landPix = landCountImg.reduceRegion({
+    reducer: ee.Reducer.count(),
+    geometry: f.geometry(),
+    scale: SCALE,
+    maxPixels: 1e9
+  }).get('one');
+  return f.set('LandPixCount', ee.Number(ee.Algorithms.If(landPix, landPix, 0)));
+});
+
+
+// =======================
+// 6) SELECTION LOGIC (Dedupe & Hybrid)
+// =======================
+// DEFINED FIRST so buildHybridForYear can see it
+function bestPerDay(dateStart, dateEnd) {
+  var raw = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
+    .filterBounds(roi)
+    .filterDate(dateStart, dateEnd)
+    .filter(ee.Filter.notNull(['DATE_ACQUIRED']));
+
+  var dates = ee.List(raw.aggregate_array('DATE_ACQUIRED')).distinct().sort();
+
+  var best = ee.ImageCollection(dates.map(function(d) {
+    d = ee.String(d);
+    var dayCol = raw.filter(ee.Filter.eq('DATE_ACQUIRED', d));
+    // Sort by Cloud Cover to pick best tile for that day
+    return ee.Image(dayCol.sort('CLOUD_COVER', true).first())
+      .set('Date', d)
+      .set('n_scenes', dayCol.size());
+  }));
+
+  return best
+    .map(maskL8) 
+    .map(function(img){ return img.updateMask(landMask).clip(roi); })
+    .map(dswe_fn);
+}
+
+function buildHybridForYear(y) {
+  y = ee.Number(y);
+  var start = ee.Date.fromYMD(y, 1, 1);
+  var end   = start.advance(1, 'year');
+
+  var perDay = bestPerDay(start, end);
+
+  // JAS: Keep ALL
+  var jas = perDay.filter(ee.Filter.calendarRange(7, 9, 'month'));
+
+  // Others: Keep ONE per month
+  var nonJasMonths = ee.List([1,2,3,4,5,6,10,11,12]);
+  
+  var pickedList = nonJasMonths.map(function(m){
+    var mc = perDay.filter(ee.Filter.calendarRange(m, m, 'month'));
+    return ee.Algorithms.If(mc.size().gt(0), ee.Image(mc.sort('CLOUD_COVER', true).first()), null);
+  });
+
+  // FIX: Remove nulls BEFORE creating ImageCollection
+  pickedList = pickedList.removeAll([null]);
+  var nonJasPicked = ee.ImageCollection.fromImages(pickedList);
+
+  return jas.merge(nonJasPicked).sort('system:time_start');
+}
+
+
+// =======================
+// 7) SAMPLE REGIONS (Fraction Calculation)
+// =======================
+function sampleHybridImage(img) {
+  var date = ee.String(img.get('Date'));
+
+  var validPix  = img.select('WI').mask().rename('ValidPix'); 
+  var waterPix  = img.select('WaterBinary').rename('WaterPix'); 
+  
+  var bandsToSum = validPix.addBands(waterPix.updateMask(validPix)); 
+  var indicesToMean = img.select(['NDWI','WI','DSWE_Class']);
+
+  // 1. Sum counts
+  var counts = bandsToSum.reduceRegions({
+    collection: regionsWithLandPix,
+    reducer: ee.Reducer.sum(),
+    scale: SCALE,
+    tileScale: TILE_SCALE
+  });
+
+  // 2. Mean indices
+  var means = indicesToMean.reduceRegions({
+    collection: regionsWithLandPix,
+    reducer: ee.Reducer.mean(),
+    scale: SCALE,
+    tileScale: TILE_SCALE
+  });
+
+  var join = ee.Join.inner();
+  var joined = join.apply(counts, means, ee.Filter.equals({leftField: 'Region_ID', rightField: 'Region_ID'}));
+
+  return joined.map(function(pair){
+    var c = ee.Feature(pair.get('primary'));   
+    var m = ee.Feature(pair.get('secondary')); 
+
+    var totalLand = ee.Number(c.get('LandPixCount'));
+    var validSum  = ee.Number(c.get('ValidPix'));
+    var waterSum  = ee.Number(c.get('WaterPix'));
+
+    var validFrac = validSum.divide(totalLand);
+    var waterFrac = ee.Algorithms.If(validSum.gt(0), waterSum.divide(validSum), 0);
+
+    return ee.Feature(null, {
+      'Region_ID':       c.get('Region_ID'),
+      'Date':            date,
+      'lon':             c.get('lon'),
+      'lat':             c.get('lat'),
+      'LandPixCount':    totalLand,
+      'ValidPixCount':   validSum,
+      'ValidFrac_Land':  validFrac, 
+      'WaterPixCount':   waterSum,
+      'WaterFrac_Valid': waterFrac, 
+      'WI_mean':         m.get('WI'),
+      'NDWI_mean':       m.get('NDWI'),
+      'DSWE_mean':       m.get('DSWE_Class')
+    });
+  });
+}
+
+
+// =======================
+// 8) DEBUG OR EXPORT (UPDATED)
+// =======================
+if (DEBUG_MODE) {
+  // --- VISUALIZATION MODE ---
+  print('Running in DEBUG MODE. Visualization only.');
+  
+  // 1. Build the collection for the year
+  var debugYear = 2020;
+  var col = buildHybridForYear(debugYear);
+  
+  // 2. FILTER FOR SEPT/OCT (RAINY SEASON) TO VERIFY FLOODS
+  // We want to see water, not dry land.
+  var wetSeasonImg = col.filter(ee.Filter.calendarRange(8, 10, 'month')).first();
+  
+  // Fallback: If no Sept image, just take the first one available
+  var sampleImg = ee.Image(ee.Algorithms.If(wetSeasonImg, wetSeasonImg, col.first()));
+
+  print('Visualizing Date:', sampleImg.get('Date'));
+  
+  // 3. RGB (Standard False Color for Water)
+  Map.addLayer(sampleImg, {bands:['SR_B6','SR_B5','SR_B4'], min:0, max:0.3}, 'Landsat SWIR/NIR/Red (Water=Black/Blue)', true);
+  
+  // 4. Water Binary (Bright Blue)
+  Map.addLayer(sampleImg.select('WaterBinary').selfMask(), {palette:['00FFFF']}, 'Detected Water Mask', true);
+  
+  // 5. Grid
+  Map.addLayer(trainingRegions, {color:'green', fillColor: '00000000'}, 'Grid Cells', true);
+  
+  // 6. PRINT VALUES FOR ONE REGION
+  // We calculate stats for this specific image
+  var debugStats = sampleHybridImage(sampleImg);
+  
+  // Print the first feature's properties directly so you don't have to click arrows
+  var firstFeature = ee.Feature(debugStats.first());
+  print('--- CHECK THESE VALUES ---');
+  print('Date:', firstFeature.get('Date'));
+  print('Valid Pixels (Not Cloud):', firstFeature.get('ValidPixCount'));
+  print('Water Pixels (Flooded):', firstFeature.get('WaterPixCount'));
+  print('Water Fraction (Label):', firstFeature.get('WaterFrac_Valid'));
+  print('Full Object:', firstFeature);
+
+} else {
+  // --- EXPORT MODE ---
+  print('Running in EXPORT MODE. Check Tasks tab.');
+  
+  var allImages = ee.ImageCollection.fromImages(
+    ee.List.sequence(START_YEAR, END_YEAR).map(function(y) {
+      return buildHybridForYear(ee.Number(y)).toList(500);
+    }).flatten()
+  ).sort('system:time_start');
+
+  var timeSeries = allImages.map(sampleHybridImage).flatten();
+
+  Export.table.toDrive({
+    collection: timeSeries,
+    description: EXPORT_DESC,
+    folder: EXPORT_FOLDER,
+    fileNamePrefix: EXPORT_PREFIX,
+    fileFormat: 'CSV',
+    selectors: [
+      'Region_ID', 'Date', 'lon', 'lat', 
+      'ValidFrac_Land', 'WaterFrac_Valid', 
+      'ValidPixCount', 'WaterPixCount', 'LandPixCount',
+      'WI_mean', 'NDWI_mean', 'DSWE_mean'
+    ]
+  });
+}
