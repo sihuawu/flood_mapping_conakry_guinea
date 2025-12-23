@@ -1,0 +1,107 @@
+// =======================================================
+// ERA5 Continuous Daily Rainfall
+// =======================================================
+
+// -----------------------
+// 0) Grid Generation 
+// -----------------------
+var eraStep = 0.25;
+var num_lon = 5;
+var num_lat = 3;
+var lon_min = -13.75;
+var lat_min = 9.25;
+var lon_max = lon_min + num_lon * eraStep;
+var lat_max = lat_min + num_lat * eraStep;
+
+var lon_boundaries = ee.List.sequence(lon_min, lon_max, eraStep);
+var lat_boundaries = ee.List.sequence(lat_min, lat_max, eraStep);
+
+var gridFeatures = ee.List.sequence(0, num_lon - 1).map(function(i) {
+  return ee.List.sequence(0, num_lat - 1).map(function(j) {
+    i = ee.Number(i); j = ee.Number(j);
+    var cell_lon_min = ee.Number(lon_boundaries.get(i));
+    var cell_lon_max = ee.Number(lon_boundaries.get(i.add(1)));
+    var cell_lat_min = ee.Number(lat_boundaries.get(j));
+    var cell_lat_max = ee.Number(lat_boundaries.get(j.add(1)));
+    
+    var rect = ee.Geometry.Rectangle([cell_lon_min, cell_lat_min, cell_lon_max, cell_lat_max], null, false);
+    var cell_id = i.add(j.multiply(num_lon)).add(1); 
+    
+    return ee.Feature(rect, { Region_ID: cell_id });
+  });
+}).flatten();
+
+var regions = ee.FeatureCollection(gridFeatures);
+
+// -----------------------
+// 1) Define Time Range
+// -----------------------
+var startDate = ee.Date('2015-01-01');
+var endDate   = ee.Date('2021-12-31');
+
+var nDays = endDate.difference(startDate, 'day').round();
+var allDates = ee.List.sequence(0, nDays).map(function(n) {
+  return startDate.advance(n, 'day');
+});
+
+print('Total days to export:', allDates.length());
+
+// -----------------------
+// 2) ERA5 Processing
+// -----------------------
+var era5 = ee.ImageCollection('ECMWF/ERA5/HOURLY');
+
+function getDailyRain(date) {
+  date = ee.Date(date);
+  var nextDay = date.advance(1, 'day');
+  
+  var dailySum = era5
+    .filterDate(date, nextDay)
+    .select('total_precipitation')
+    .sum()                
+    .multiply(1000)       
+    .rename('daily_rain_mm');
+    
+  return dailySum
+    .set('system:time_start', date.millis())
+    .set('date_str', date.format('YYYY-MM-dd'));
+}
+
+// -----------------------
+// 3) Map over ALL dates
+// -----------------------
+var dailyRainFC = ee.FeatureCollection(allDates.map(function(d) {
+  var dailyImg = getDailyRain(d);
+  var dateStr = dailyImg.get('date_str');
+  
+ 
+  var reduced = dailyImg.reduceRegions({
+    collection: regions,
+    reducer: ee.Reducer.mean().setOutputs(['Precip_mm']), 
+    scale: 27830, 
+    tileScale: 8
+  });
+  
+  // Clean up features
+  return reduced.map(function(f) {
+    return ee.Feature(null, {
+      'Region_ID': f.get('Region_ID'),
+      'Date': dateStr,
+      
+      'Precip_mm': f.get('Precip_mm') 
+    });
+  });
+})).flatten();
+
+print('First 5 rows check:', dailyRainFC.limit(5));
+
+// -----------------------
+// 4) Export
+// -----------------------
+Export.table.toDrive({
+  collection: dailyRainFC,
+  description: 'ERA5_Daily_Rainfall_Continuous_2015_2021_v2',
+  folder: 'EarthEngine_ML_Data',
+  fileNamePrefix: 'era5_daily_continuous_2015_2021_v2',
+  fileFormat: 'CSV'
+});
