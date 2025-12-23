@@ -1,0 +1,456 @@
+// =======================================================
+// SAME-DAY MOSAICKING
+// Landsat 5/7/8/9 C2 L2 SR
+// =======================================================
+
+// =======================
+// 0) SETTINGS
+// =======================
+var DEBUG_MODE = false;      // TRUE = visualize, FALSE = export
+var START_YEAR = 2001;
+var END_YEAR   = 2024;
+
+// --- EXACT SAME ROI/grid params as rainfall code ---
+var eraStep     = 0.1;
+var old_eraStep = 0.25;
+var num_lon = 5;
+var num_lat = 3;
+var lon_min = -13.75;
+var lat_min =  9.25;
+
+var original_lon_max = lon_min + (num_lon * old_eraStep); // -12.5
+var lat_max = lat_min + (num_lat * old_eraStep);         // 10.0
+var lon_max = original_lon_max - (6 * eraStep);          // -13.1
+
+var roi = ee.Geometry.BBox(lon_min, lat_min, lon_max, lat_max);
+
+// Grid scale EXACTLY like rainfall code (~11 km)
+var gridScale = 11132;
+var projection = ee.Projection('EPSG:4326').atScale(gridScale);
+
+// Wet season = July to September
+var WET_START_MONTH = 7;
+var WET_END_MONTH   = 9;
+
+var SCALE = 30;
+var TILE_SCALE = 16;
+
+// QC thresholds
+var MIN_ROI_VALID_FRAC = 0.01;
+var MIN_CELL_VALID_FRAC = 0.00;
+
+var EXPORT_FOLDER = 'GEE_Flood_Analysis';
+var EXPORT_DESC   = 'Guinea_LandsatMerged_DailyMosaic_DSWE_NDWI_2001_2024_MATCH_RAIN_GRID_QC';
+var EXPORT_PREFIX = 'guinea_ls_merged_dailyMOSAIC_match_rain_grid_qc';
+
+// Permanent water option
+var EXCLUDE_PERM_WATER = false;
+
+// Visualization toggles
+var SHOW_GRID = true;
+var SHOW_GRID_IDS = true;
+var SHOW_CENTROIDS = false;
+
+Map.centerObject(roi, 9);
+Map.addLayer(roi, {color:'red', fillColor:'00000000'}, 'ROI', true);
+
+// =======================
+// 1) GRID: MATCH RAINFALL (coveringGrid)
+// =======================
+var rawGrid = roi.coveringGrid(projection);   
+var gridSize = rawGrid.size();
+print('✅ Grid Created (should match rainfall):', gridSize);
+
+var gridList = rawGrid.toList(gridSize);
+var idList = ee.List.sequence(0, gridSize.subtract(1));
+
+var grid = ee.FeatureCollection(idList.map(function(i){
+  i = ee.Number(i);
+  var f = ee.Feature(gridList.get(i));
+  var centroid = f.geometry().centroid(1).coordinates();
+  return f.set({
+    'region_id': i,
+    'lon': centroid.get(0),
+    'lat': centroid.get(1)
+  });
+}));
+
+if (SHOW_GRID) {
+  Map.addLayer(grid.style({
+    color: '00FF00',
+    fillColor: '00000000',
+    width: 2
+  }), {}, 'Grid cells', true);
+
+  if (SHOW_CENTROIDS) {
+    var centroids = grid.map(function(f) {
+      return ee.Feature(f.geometry().centroid(1), f.toDictionary(['region_id']));
+    });
+    Map.addLayer(centroids.style({color: 'FFFF00', pointSize: 4}), {}, 'Grid centroids', false);
+  }
+
+  if (SHOW_GRID_IDS) {
+    var labelPoints = grid.map(function(f) {
+      var c = f.geometry().centroid(1);
+      return ee.Feature(c, {label: ee.Number(f.get('region_id')).format('%d')});
+    });
+
+    // BEST (if you have it): uncomment
+    // var text = require('users/gena/packages:text');
+    // var labels = text.draw(labelPoints, 'label', Map.getScale(), {
+    //   fontSize: 16,
+    //   textColor: 'ffffff',
+    //   outlineColor: '000000',
+    //   outlineWidth: 3,
+    //   textOpacity: 0.9
+    // });
+    // Map.addLayer(labels, {}, 'Grid IDs', true);
+
+    Map.addLayer(labelPoints.style({color: 'FFFFFF', pointSize: 3}), {}, 'Grid ID points (inspect)', false);
+  }
+}
+
+// =======================
+// 2) LAND MASK (DEM-based)
+// =======================
+var dem = ee.Image('USGS/SRTMGL1_003');
+var landMask = dem.mask();
+
+// Optional permanent water mask (JRC occurrence)
+var permWaterMask = ee.Image(1);
+if (EXCLUDE_PERM_WATER) {
+  var gsw = ee.Image('JRC/GSW1_4/GlobalSurfaceWater').select('occurrence');
+  permWaterMask = gsw.lt(50);
+}
+
+// =======================
+// 3) LANDSAT MASK + HARMONIZE (L5/L7/L8/L9)
+// =======================
+function cloudMaskExclusive(image) {
+  var qa = image.select('QA_PIXEL');
+  var mask = qa.bitwiseAnd(1 << 0).eq(0) // Fill
+    .and(qa.bitwiseAnd(1 << 1).eq(0))    // Dilated cloud
+    .and(qa.bitwiseAnd(1 << 3).eq(0))    // Cloud
+    .and(qa.bitwiseAnd(1 << 4).eq(0));   // Cloud shadow
+  return image.updateMask(mask);
+}
+
+function prepLandsat(image, sensor) {
+  image = cloudMaskExclusive(image);
+
+  var green = (sensor === 'L89') ? 'SR_B3' : 'SR_B2';
+  var nir   = (sensor === 'L89') ? 'SR_B5' : 'SR_B4';
+  var swir1 = (sensor === 'L89') ? 'SR_B6' : 'SR_B5';
+
+  var out = image.select([green, nir, swir1], ['green','nir','swir1'])
+    .multiply(0.0000275).add(-0.2)
+    .copyProperties(image, image.propertyNames())
+    .set('system:time_start', image.get('system:time_start'));
+
+  var cc = ee.Algorithms.If(
+    image.get('CLOUD_COVER'),
+    image.get('CLOUD_COVER'),
+    ee.Algorithms.If(image.get('CLOUD_COVER_LAND'), image.get('CLOUD_COVER_LAND'), 9999)
+  );
+
+  return out.set('CC', ee.Number(cc));
+}
+
+function getLandsatMerged(dateStart, dateEnd) {
+  var l9 = ee.ImageCollection('LANDSAT/LC09/C02/T1_L2')
+    .filterBounds(roi).filterDate(dateStart, dateEnd)
+    .map(function(img){ return prepLandsat(img, 'L89'); });
+
+  var l8 = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
+    .filterBounds(roi).filterDate(dateStart, dateEnd)
+    .map(function(img){ return prepLandsat(img, 'L89'); });
+
+  var l7 = ee.ImageCollection('LANDSAT/LE07/C02/T1_L2')
+    .filterBounds(roi).filterDate(dateStart, dateEnd)
+    .map(function(img){ return prepLandsat(img, 'L57'); });
+
+  var l5 = ee.ImageCollection('LANDSAT/LT05/C02/T1_L2')
+    .filterBounds(roi).filterDate(dateStart, dateEnd)
+    .map(function(img){ return prepLandsat(img, 'L57'); });
+
+  return ee.ImageCollection(l9.merge(l8).merge(l7).merge(l5));
+}
+
+// =======================
+// 4) WATER INDICES + DSWE 
+// =======================
+function addWaterBands(image) {
+  var ndwi  = image.normalizedDifference(['green','nir']).rename('NDWI');
+  var mndwi = image.normalizedDifference(['green','swir1']).rename('MNDWI');
+  var wi    = ndwi.max(mndwi).rename('WI');
+
+  var dswe = ee.Image(0)
+    .where(wi.gt(0.10), 1)
+    .where(wi.gt(0.20), 2)
+    .where(wi.gt(0.30), 3)
+    .where(wi.gt(0.40), 4)
+    .rename('DSWE_Class')
+    .updateMask(wi.mask());
+
+  var waterBinary = dswe.gt(0).rename('WaterBinary');
+  return image.addBands([ndwi, mndwi, wi, dswe, waterBinary]);
+}
+
+// =======================
+// 5) PRECOMPUTE LAND PIXEL COUNT PER CELL (ValidFrac_Land)
+// =======================
+var landCountImg = ee.Image.constant(1).updateMask(landMask).rename('one');
+var landCountImg_noPerm = ee.Image.constant(1).updateMask(landMask).updateMask(permWaterMask).rename('one_noPerm');
+
+var regionsWithCounts = grid.map(function(f) {
+  var landPix = landCountImg.reduceRegion({
+    reducer: ee.Reducer.count(),
+    geometry: f.geometry(),
+    scale: SCALE,
+    maxPixels: 1e9
+  }).get('one');
+
+  var landPixNoPerm = landCountImg_noPerm.reduceRegion({
+    reducer: ee.Reducer.count(),
+    geometry: f.geometry(),
+    scale: SCALE,
+    maxPixels: 1e9
+  }).get('one_noPerm');
+
+  return f.set({
+    'LandPixCount': ee.Number(ee.Algorithms.If(landPix, landPix, 0)),
+    'LandPixCount_NoPerm': ee.Number(ee.Algorithms.If(landPixNoPerm, landPixNoPerm, 0))
+  });
+});
+
+var roiLandPix = landCountImg.reduceRegion({
+  reducer: ee.Reducer.count(),
+  geometry: roi,
+  scale: SCALE,
+  maxPixels: 1e10
+}).getNumber('one');
+print('ROI land pixels (for QC):', roiLandPix);
+
+// =======================
+// 6) DAILY MOSAIC (SAME-DAY) + HYBRID SELECTION
+// =======================
+function dailyMosaicPerDay(dateStart, dateEnd) {
+  var raw = getLandsatMerged(dateStart, dateEnd)
+    .map(function(img){
+      var d = ee.Date(img.get('system:time_start')).format('YYYY-MM-dd');
+      return img.set('DateStr', d);
+    });
+
+  var dates = ee.List(raw.aggregate_array('DateStr')).distinct().sort();
+
+  var dailyList = dates.map(function(d) {
+    d = ee.String(d);
+    var dayCol = raw.filter(ee.Filter.eq('DateStr', d)).sort('CC', true);
+    var n = dayCol.size();
+
+    return ee.Algorithms.If(n.eq(0), null, (function(){
+      var ccStats = ee.Dictionary(dayCol.aggregate_stats('CC'));
+      var ccMin = ee.Number(ee.Algorithms.If(ccStats.contains('min'), ccStats.get('min'), 9999));
+      var ccMed = ee.Number(ee.Algorithms.If(ccStats.contains('median'), ccStats.get('median'), ccMin));
+
+      // FIX A: assign timestamp so calendarRange works
+      var t = ee.Date(d).millis();
+
+      var mos = dayCol.mosaic()
+        .set('Date', d)
+        .set('n_scenes', n)
+        .set('CC_min', ccMin)
+        .set('CC_med', ccMed)
+        .set('system:time_start', t);
+
+      mos = mos.updateMask(landMask).clip(roi);
+      mos = addWaterBands(mos);
+
+      return mos;
+    })());
+  });
+
+  dailyList = ee.List(dailyList).removeAll([null]);
+  return ee.ImageCollection.fromImages(dailyList);
+}
+
+function addRoiValidFrac(img) {
+  var validCount = ee.Image.constant(1)
+    .updateMask(img.select('WI').mask())
+    .reduceRegion({
+      reducer: ee.Reducer.sum(),
+      geometry: roi,
+      scale: SCALE,
+      maxPixels: 1e10
+    }).getNumber('constant');
+
+  var frac = ee.Algorithms.If(roiLandPix.gt(0), validCount.divide(roiLandPix), 0);
+
+  return img.set({
+    'ROI_ValidPix': validCount,
+    'ROI_ValidFrac': ee.Number(frac)
+  });
+}
+
+function buildHybridForYear(y) {
+  y = ee.Number(y);
+  var start = ee.Date.fromYMD(y, 1, 1);
+  var end   = start.advance(1, 'year');
+
+  var perDay = dailyMosaicPerDay(start, end)
+    .map(addRoiValidFrac)
+    .filter(ee.Filter.gte('ROI_ValidFrac', MIN_ROI_VALID_FRAC));
+
+  var wet = perDay.filter(ee.Filter.calendarRange(WET_START_MONTH, WET_END_MONTH, 'month'));
+
+  var otherMonths = ee.List([1,2,3,4,5,6,10,11,12]);
+  var pickedList = otherMonths.map(function(m){
+    var mc = perDay.filter(ee.Filter.calendarRange(m, m, 'month'));
+    return ee.Algorithms.If(mc.size().gt(0),
+      ee.Image(mc.sort('CC_min', true).first()),
+      null
+    );
+  });
+
+  pickedList = pickedList.removeAll([null]);
+  var otherPicked = ee.ImageCollection.fromImages(pickedList);
+
+  return wet.merge(otherPicked).sort('system:time_start');
+}
+
+// =======================
+// 7) SAMPLE REGIONS (EXPORT)
+// =======================
+function sampleHybridImage(img) {
+  var date = ee.String(img.get('Date'));
+
+  var validOne = ee.Image.constant(1)
+    .updateMask(img.select('WI').mask())
+    .rename('ValidPixCount');
+
+  var waterOne = ee.Image.constant(1)
+    .updateMask(img.select('WaterBinary').eq(1))
+    .updateMask(img.select('WI').mask())
+    .rename('WaterPixCount');
+
+  var waterOneNoPerm = ee.Image.constant(1)
+    .updateMask(img.select('WaterBinary').eq(1))
+    .updateMask(img.select('WI').mask())
+    .updateMask(permWaterMask)
+    .rename('WaterPixCount_NoPerm');
+
+  var bandsToSum = validOne.addBands(waterOne).addBands(waterOneNoPerm);
+  var indicesToMean = img.select(['NDWI', 'DSWE_Class']);
+
+  var counts = bandsToSum.reduceRegions({
+    collection: regionsWithCounts,
+    reducer: ee.Reducer.sum(),
+    scale: SCALE,
+    tileScale: TILE_SCALE
+  });
+
+  var means = indicesToMean.reduceRegions({
+    collection: regionsWithCounts,
+    reducer: ee.Reducer.mean(),
+    scale: SCALE,
+    tileScale: TILE_SCALE
+  });
+
+  var joined = ee.Join.inner().apply(
+    counts, means,
+    ee.Filter.equals({leftField: 'region_id', rightField: 'region_id'})
+  );
+
+  return joined.map(function(pair){
+    var c = ee.Feature(pair.get('primary'));
+    var m = ee.Feature(pair.get('secondary'));
+
+    var totalLand = ee.Number(c.get('LandPixCount'));
+    var validSum  = ee.Number(c.get('ValidPixCount'));
+    var waterSum  = ee.Number(c.get('WaterPixCount'));
+    var waterSumNP= ee.Number(c.get('WaterPixCount_NoPerm'));
+
+    var validFracLand = ee.Algorithms.If(totalLand.gt(0), validSum.divide(totalLand), 0);
+    var waterFracValid = ee.Algorithms.If(validSum.gt(0), waterSum.divide(validSum), 0);
+    var waterFracValidNP = ee.Algorithms.If(validSum.gt(0), waterSumNP.divide(validSum), 0);
+
+    var keepRow = ee.Number(validFracLand).gte(MIN_CELL_VALID_FRAC);
+
+    var props = ee.Dictionary({
+      'region_id': c.get('region_id'),
+      'date': date,
+      'lat': c.get('lat'),
+      'lon': c.get('lon'),
+
+      'LandPixCount': totalLand,
+      'ValidPixCount': validSum,
+      'ValidFrac_Land': validFracLand,
+
+      'WaterPixCount': waterSum,
+      'WaterFrac_Valid': waterFracValid,
+
+      'WaterPixCount_NoPerm': waterSumNP,
+      'WaterFrac_Valid_NoPerm': waterFracValidNP,
+
+      'NDWI_mean': m.get('NDWI'),
+      'DSWE_mean': m.get('DSWE_Class'),
+
+      'n_scenes': img.get('n_scenes'),
+      'CC_min': img.get('CC_min'),
+      'CC_med': img.get('CC_med'),
+      'ROI_ValidFrac': img.get('ROI_ValidFrac'),
+      'ROI_ValidPix': img.get('ROI_ValidPix')
+    });
+
+    return ee.Feature(null, props).set('keep', keepRow);
+  }).filter(ee.Filter.eq('keep', 1));
+}
+
+// =======================
+// 8) DEBUG OR EXPORT
+// =======================
+if (DEBUG_MODE) {
+  print('Running DEBUG MODE.');
+
+  var debugYear = 2020;
+  var col = buildHybridForYear(debugYear);
+
+  var sampleImg = ee.Image(col.first());
+
+  print('Visualizing Date:', sampleImg.get('Date'));
+  print('ROI_ValidFrac:', sampleImg.get('ROI_ValidFrac'));
+  print('CC_min:', sampleImg.get('CC_min'), 'CC_med:', sampleImg.get('CC_med'), 'n_scenes:', sampleImg.get('n_scenes'));
+
+  Map.addLayer(sampleImg, {bands:['swir1','nir','green'], min:0, max:0.3}, 'SWIR/NIR/Green', true);
+  Map.addLayer(sampleImg.select('WaterBinary').selfMask(), {palette:['00FFFF']}, 'WaterBinary', true);
+
+  var stats = sampleHybridImage(sampleImg);
+  print('One feature:', ee.Feature(stats.first()));
+
+} else {
+  print('Running EXPORT MODE. Check Tasks.');
+
+  var allImages = ee.ImageCollection.fromImages(
+    ee.List.sequence(START_YEAR, END_YEAR).map(function(y) {
+      return buildHybridForYear(ee.Number(y)).toList(800);
+    }).flatten()
+  ).sort('system:time_start');
+
+  var timeSeries = allImages.map(sampleHybridImage).flatten();
+
+  Export.table.toDrive({
+    collection: timeSeries,
+    description: EXPORT_DESC,
+    folder: EXPORT_FOLDER,
+    fileNamePrefix: EXPORT_PREFIX,
+    fileFormat: 'CSV',
+    selectors: [
+      'region_id','date','lat','lon',
+      'ValidFrac_Land','ValidPixCount','LandPixCount',
+      'WaterFrac_Valid','WaterPixCount',
+      'WaterFrac_Valid_NoPerm','WaterPixCount_NoPerm',
+      'NDWI_mean','DSWE_mean',
+      'n_scenes','CC_min','CC_med','ROI_ValidFrac','ROI_ValidPix'
+    ]
+  });
+}
