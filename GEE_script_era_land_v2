@@ -1,0 +1,181 @@
+// =======================================================
+// VERSION V2 (ITERATION): ERA5-Land HOURLY -> DAILY rainfall (mm/day)
+// Goal: keep your SAME ROI + coveringGrid, but ensure coastal (part land/part ocean)
+// cells STILL get rainfall values.
+//
+// =======================================================
+
+// =======================
+// 0) SETTINGS
+// =======================
+var START_DATE = '2001-01-01';
+var END_DATE   = '2024-12-31';
+
+var EXPORT_FOLDER = 'Flood_Analysis';
+var EXPORT_DESC   = 'Guinea_ERA5Land_DailyRain_Filled';
+var EXPORT_PREFIX = 'guinea_era5land_dailyrain_filled';
+
+// Toggle: if true, fill ERA5-Land masked pixels with ERA5.
+// If false, you’ll get the original behavior (nulls over ocean).
+var FILL_OCEAN_WITH_ERA5 = true;
+
+// --- EXACT SAME ROI/grid params as your Landsat script ---
+var eraStep     = 0.1;
+var old_eraStep = 0.25;
+var num_lon = 5;
+var num_lat = 3;
+var lon_min = -13.75;
+var lat_min =  9.25;
+
+var original_lon_max = lon_min + (num_lon * old_eraStep); // -12.5
+var lat_max = lat_min + (num_lat * old_eraStep);          // 10.0
+var lon_max = original_lon_max - (6 * eraStep);           // -13.1
+
+var roi = ee.Geometry.BBox(lon_min, lat_min, lon_max, lat_max);
+
+// Grid scale EXACTLY like Landsat (~11 km)
+var gridScale = 11132;
+var projection = ee.Projection('EPSG:4326').atScale(gridScale);
+
+// =======================
+// 1) VISUALIZATION
+// =======================
+Map.centerObject(roi, 9);
+Map.addLayer(roi, {color: 'red'}, 'ROI (AOI)', true);
+
+// Build grid exactly like Landsat: coveringGrid(projection) + explicit id
+var rawGrid = roi.coveringGrid(projection);
+var gridSize = rawGrid.size();
+print('✅ Grid Created (should match Landsat):', gridSize);
+
+var gridList = rawGrid.toList(gridSize);
+var idList = ee.List.sequence(0, gridSize.subtract(1));
+
+var grid = ee.FeatureCollection(idList.map(function(i){
+  i = ee.Number(i);
+  var f = ee.Feature(gridList.get(i));
+  var centroid = f.geometry().centroid(1).coordinates();
+  return f.set({
+    'region_id': i,
+    'lon': centroid.get(0),
+    'lat': centroid.get(1)
+  });
+}));
+
+// Green grid overlay
+Map.addLayer(
+  grid.style({color:'00FF00', fillColor:'00000000', width: 2}),
+  {},
+  'Grid cells (match Landsat)',
+  true
+);
+
+// =======================
+// 2) DAILY RAINFALL (mm/day)
+// =======================
+// ERA5-Land hourly 'total_precipitation' is in meters.
+// Summing hourly over 24h => meters/day, then *1000 => mm/day.
+//
+// IMPORTANT: FILLING STRATEGY
+//   daily_land = ERA5-Land sum
+//   daily_ocean = ERA5 sum
+//   daily = daily_land.unmask(daily_ocean)  (if enabled)
+
+var start = ee.Date(START_DATE);
+var end   = ee.Date(END_DATE);
+
+// Build daily date list [start, end)
+var nDays = end.difference(start, 'day');
+var dayOffsets = ee.List.sequence(0, nDays.subtract(1));
+
+function dailyFromCollection(collectionId, date, next) {
+  // Returns an image with band 'rain_mm'
+  return ee.ImageCollection(collectionId)
+    .filterDate(date, next)
+    .select('total_precipitation')
+    .sum()             // meters/day
+    .multiply(1000)    // mm/day
+    .rename('rain_mm');
+}
+
+function makeDailyRain(dayOffset) {
+  dayOffset = ee.Number(dayOffset);
+  var date = start.advance(dayOffset, 'day');
+  var next = date.advance(1, 'day');
+
+  var dailyLand = dailyFromCollection('ECMWF/ERA5_LAND/HOURLY', date, next);
+  var daily = dailyLand;
+
+  if (FILL_OCEAN_WITH_ERA5) {
+    // ERA5 (global) includes ocean, great for coastal/ocean fill
+    var dailyEra5 = dailyFromCollection('ECMWF/ERA5/HOURLY', date, next);
+    daily = dailyLand.unmask(dailyEra5);
+  }
+
+  // Set metadata
+  daily = daily.set({
+    'date_str': date.format('YYYY-MM-dd'),
+    'system:time_start': date.millis()
+  });
+
+  return daily;
+}
+
+var dailyRain = ee.ImageCollection(dayOffsets.map(makeDailyRain));
+print('Daily rainfall images:', dailyRain.size());
+
+// Quick sanity check visual layer for a single date (optional)
+var debugDate = ee.Date('2019-08-01');
+var debugImg = makeDailyRain(debugDate.difference(start, 'day')).clip(roi);
+Map.addLayer(debugImg, {}, 'Debug rain_mm (2019-08-01)', false);
+
+// =======================
+// 3) REDUCE TO GRID (mean per cell)
+// =======================
+// We reduce the 'rain_mm' band. The reducer output property is 'mean'.
+// We also explicitly set the 'date' property, and keep region_id/lon/lat.
+
+function reduceToGrid(img) {
+  var dateStr = ee.String(img.get('date_str'));
+
+  var fc = img.reduceRegions({
+    collection: grid,
+    reducer: ee.Reducer.mean(),
+    scale: gridScale,
+    crs: projection
+  });
+
+  return fc.map(function(f){
+    f = ee.Feature(f);
+    return f.set({
+      'date': dateStr,
+      // ensure we’re exporting the reducer output
+      'mean': f.get('mean')
+    });
+  });
+}
+
+var table = dailyRain.map(reduceToGrid).flatten();
+
+// OPTIONAL: If you want to guarantee non-null values even if BOTH datasets fail
+// (rare), you can fill remaining nulls with 0. Uncomment if desired.
+// table = table.map(function(f){
+//   f = ee.Feature(f);
+//   var m = ee.Number(f.get('mean'));
+//   return f.set('mean', ee.Algorithms.If(f.get('mean'), f.get('mean'), 0));
+// });
+
+// =======================
+// 4) EXPORT
+// =======================
+Export.table.toDrive({
+  collection: table,
+  description: EXPORT_DESC,
+  folder: EXPORT_FOLDER,
+  fileNamePrefix: EXPORT_PREFIX,
+  fileFormat: 'CSV',
+  selectors: ['region_id', 'date', 'lat', 'lon', 'mean']
+});
+
+print('🚀 Export started. Check the Tasks tab.');
+print('FILL_OCEAN_WITH_ERA5 =', FILL_OCEAN_WITH_ERA5);
